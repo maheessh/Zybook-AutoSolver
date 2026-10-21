@@ -1,1243 +1,500 @@
-const { chromium } = require('playwright');
-const fs = require('node:fs');
-const path = require('node:path');
-const readline = require('node:readline/promises');
-const { stdin, stdout } = require('node:process');
-const { createHash } = require('node:crypto');
 
-const COURSE = 'SOUTHEASTERNCMPS2940KoutsougerasFall2026';
-const ROOT = `https://learn.zybooks.com/zybook/${COURSE}`;
+/*
+ * zyBooks Console Section Runner v6 (no Node.js or Playwright)
+ * Participation only. Do not use where course rules prohibit automation.
+ */
+(async () => {
+  'use strict';
 
-const PROFILE = path.join(__dirname, '.zybooks-v5-profile');
-const HISTORY = path.join(__dirname, '.zybooks-v5-history.json');
-
-const ACTIVITY = '.interactive-activity-container.participation';
-const TILE = '.draggable-object';
-const TARGET = '.draggable-object-target.definition-drag-container';
-
-const wait = ms => new Promise(r => setTimeout(r, ms));
-const norm = text => String(text || '').replace(/\s+/g, ' ').trim();
-const keyHash = text =>
-  createHash('sha256').update(text).digest('hex').slice(0, 16);
-
-let wrong = {};
-
-try {
-  wrong = JSON.parse(fs.readFileSync(HISTORY, 'utf8'));
-} catch {}
-
-const saveWrong = (key, index) => {
-  wrong[key] ||= [];
-
-  if (!wrong[key].includes(index)) {
-    wrong[key].push(index);
-    fs.writeFileSync(HISTORY, JSON.stringify(wrong, null, 2));
+  if (location.hostname !== 'learn.zybooks.com') {
+    console.error('Run this on learn.zybooks.com');
+    return;
   }
-};
+  window.zyRunner?.stop?.();
+  window.zyPA?.stop?.();
+  document.getElementById('zy-v6-panel')?.remove();
+  document.getElementById('zy-v6-frame')?.remove();
 
-const wasWrong = (key, index) =>
-  (wrong[key] || []).includes(index);
-
-const ctl = {
-  stop: false,
-  actions: 0,
-  skipped: 0,
-  results: []
-};
-
-// ---------- Section navigation ----------
-
-function validSection(url) {
-  try {
-    const u = new URL(url);
-
-    return (
-      u.origin === 'https://learn.zybooks.com' &&
-      u.pathname.startsWith(`/zybook/${COURSE}/chapter/`) &&
-      /^\/zybook\/[^/]+\/chapter\/\d+\/section\/\d+$/.test(u.pathname)
-    );
-  } catch {
-    return false;
+  const match = location.pathname.match(/^\/zybook\/([^/]+)/);
+  if (!match) { console.error('Open your zyBooks course first.'); return; }
+  const course = match[1];
+  const root = `${location.origin}/zybook/${course}`;
+  const A = '.interactive-activity-container.participation';
+  const T = '.draggable-object';
+  const D = '.draggable-object-target.definition-drag-container';
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const q = (node, css) => node?.querySelector(css) ?? null;
+  const qa = (node, css) => Array.from(node?.querySelectorAll(css) || []);
+  const clean = x => String(x || '').replace(/\s+/g, ' ').trim();
+  const visible = node => !!(node?.isConnected && node.getClientRects().length);
+  const hash = s => { let h = 2166136261; for (const c of String(s)) h = Math.imul(h ^ c.charCodeAt(0), 16777619); return (h >>> 0).toString(36); };
+  const key = `zy-v6-wrong:${course}`;
+  let wrong = {};
+  try { wrong = JSON.parse(sessionStorage.getItem(key) || '{}') || {}; } catch {}
+  const rejected = (id, value) => (wrong[id] || []).includes(String(value));
+  function remember(id, value) {
+    if (rejected(id, value)) return;
+    (wrong[id] ??= []).push(String(value));
+    try { sessionStorage.setItem(key, JSON.stringify(wrong)); } catch {}
   }
-}
 
-// ---------- Completion detection ----------
+  const runner = {
+    stopped: false, paused: false, busy: false,
+    stats: { sections: 0, skippedSections: 0, complete: 0, skippedActivities: 0, actions: 0, reviews: 0 },
+    results: [], current: null,
+    stop() { runner.stopped = true; runner.paused = false; log('Stop requested.'); },
+    pause() { runner.paused = true; log('Paused.'); },
+    resume() { runner.paused = false; log('Resuming.'); },
+    summary() { return { ...runner.stats, current: runner.current, results: runner.results }; },
+    clearHistory() { wrong = {}; sessionStorage.removeItem(key); log('Remembered wrong attempts cleared.'); }
+  };
+  window.zyRunner = runner;
+  async function proceed() {
+    if (runner.stopped) throw Error('Stopped by user');
+    while (runner.paused && !runner.stopped) await sleep(180);
+    if (runner.stopped) throw Error('Stopped by user');
+  }
 
-async function status(activity) {
-  return activity.evaluate(root => {
-    const norm = t =>
-      String(t || '').replace(/\s+/g, ' ').trim();
+  // UI and TOC picker
+  const panel = document.createElement('aside');
+  panel.id = 'zy-v6-panel';
+  panel.style.cssText = 'position:fixed;z-index:2147483647;right:12px;top:12px;width:345px;max-width:calc(100vw - 25px);max-height:93vh;overflow:auto;color:#f5f7fa;background:#172638;padding:14px;border-radius:12px;box-shadow:0 8px 32px #0007;font:13px system-ui';
+  panel.innerHTML = `
+    <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+      <strong style="font-size:15px">zyBooks Console Runner v6</strong><button data-minimize title="Minimize panel">−</button>
+    </div>
+    <div data-content>
+      <p style="margin:7px 0">Choose sections. Completed (100%) sections are skipped by default.</p>
+      <div style="display:flex;gap:5px;flex-wrap:wrap">
+        <button data-scan>Scan TOC</button><button data-all>Select unfinished</button><button data-none>Clear</button>
+      </div>
+      <div data-list style="border:1px solid #627080;padding:6px;margin-top:7px;max-height:210px;overflow:auto"></div>
+      <input data-manual style="width:100%;box-sizing:border-box;margin-top:7px;padding:6px;color:#101820" placeholder="Or enter: 6.1, 6.6-6.10, 7.2" />
+      <label style="display:block;margin-top:7px"><input data-skip type="checkbox" checked /> Skip sections labeled 100%</label>
+      <label style="display:block;margin:6px 0"><input data-match type="checkbox" checked /> Try matching (synthetic drag; may fail)</label>
+      <label style="display:block;margin:6px 0"><input data-spa type="checkbox" /> If iframe blocked, try TOC links (may reload page)</label>
+      <div style="display:flex;gap:5px;flex-wrap:wrap;margin:8px 0">
+        <button data-run style="background:#a1edc6;color:#162719;font-weight:700">Run selected</button>
+        <button data-current>Current section</button>
+        <button data-pause>Pause</button><button data-stop>Stop</button>
+      </div>
+      <div data-status style="white-space:pre-wrap;border-top:1px solid #667489;padding-top:7px">Ready.</div>
+      <div data-log style="margin-top:6px;max-height:160px;overflow:auto;color:#bbcada;font-size:11px"></div>
+      <button data-close-frame style="margin-top:7px">Hide section viewer</button>
+    </div>`;
+  document.body.appendChild(panel);
+  const $ = attr => panel.querySelector(`[data-${attr}]`);
+  const list = $('list');
+  const status = $('status');
+  const logs = $('log');
+  const log = (...args) => {
+    const message = args.map(String).join(' ');
+    console.log('[zyRunner]', message);
+    const div = document.createElement('div'); div.textContent = message;
+    logs.prepend(div);
+    while (logs.children.length > 45) logs.lastElementChild.remove();
+    status.textContent = `${message}\n${runner.stats.complete} verified complete · ${runner.stats.skippedActivities} activity skips · ${runner.stats.actions} actions · ${runner.stats.reviews} reviews`;
+  };
+  $('minimize').onclick = () => {
+    const content = $('content');
+    content.hidden = !content.hidden;
+    $('minimize').textContent = content.hidden ? '+' : '−';
+  };
+  $('pause').onclick = () => {
+    if (runner.paused) runner.resume(); else runner.pause();
+    $('pause').textContent = runner.paused ? 'Resume' : 'Pause';
+  };
+  $('stop').onclick = () => runner.stop();
+  let frame;
+  $('close-frame').onclick = () => { if (frame) frame.style.display = frame.style.display === 'none' ? 'block' : 'none'; };
 
-    const feedback = node => {
-      const correct = Boolean(node.querySelector(
-        '.zb-explanation.correct, .message.correct, ' +
-        '[aria-label="Question completed"]'
-      ));
-
-      const incorrect = Boolean(node.querySelector(
-        '.zb-explanation.incorrect, .message.incorrect'
-      )) || [...node.querySelectorAll(
-        '.message,.zb-explanation'
-      )].some(x =>
-        /^(incorrect|wrong|try again|not quite)\b/i
-          .test(norm(x.textContent))
-      );
-
-      return {
-        correct,
-        incorrect: incorrect && !correct
-      };
-    };
-
-    const targets = [...root.querySelectorAll(
-      '.draggable-object-target.definition-drag-container'
-    )];
-
-    const rows = targets.map(t => {
-      const wrapper = t.parentElement || t;
-      const tile = t.querySelector('.draggable-object');
-
-      const good = Boolean(wrapper.querySelector(
-        '.correct, [aria-label="Question completed"]'
-      ));
-
-      const bad = Boolean(
-        wrapper.querySelector('.incorrect')
-      );
-
-      return {
-        label: norm(tile?.textContent),
-        occupied: Boolean(
-          tile || t.querySelector('.term-bucket.populated')
-        ),
-        good,
-        bad: bad && !good
-      };
-    });
-
-    const questions = [...root.querySelectorAll(
-      '.multiple-choice-question, .short-answer-question'
-    )].map(feedback);
-
-    const chevrons = [...root.querySelectorAll('.zb-chevron')];
-
-    const marked = Boolean(
-      root.querySelector('[aria-label="Activity completed"]')
-    ) || (
-      chevrons.length > 0 &&
-      chevrons.every(el => el.classList.contains('filled'))
-    );
-
-    // A completed activity is never repeated unless live
-    // feedback explicitly contradicts the completion marker.
-    const complete =
-      marked &&
-      rows.every(r => !r.bad) &&
-      questions.every(q => !q.incorrect);
-
-    return {
-      complete,
-      marked,
-      rows,
-      questions
-    };
+  function parseSection(url) {
+    try {
+      const u = new URL(url, location.href);
+      const m = u.pathname.match(/^\/zybook\/([^/]+)\/chapter\/(\d+)\/section\/(\d+)\/?$/);
+      if (!m || u.origin !== location.origin || m[1] !== course) return null;
+      return { ch: +m[2], sec: +m[3], num: `${m[2]}.${m[3]}`, url: `${root}/chapter/${+m[2]}/section/${+m[3]}` };
+    } catch { return null; }
+  }
+  function tocState(anchor) {
+    // Find the smallest ancestor containing one section link and the percentage.
+    let parent = anchor;
+    for (let i = 0; i < 5 && parent && parent !== document.body; i++, parent = parent.parentElement) {
+      const count = qa(parent, 'a[href]').filter(x => parseSection(x.href)).length;
+      if (count === 1 && /(?:100\s*%|no points|not complete|\d+\s*%)/i.test(clean(parent.textContent))) {
+        const text = clean(parent.textContent);
+        return { done: /\b100\s*%/i.test(text), noPoints: /no points/i.test(text) };
+      }
+    }
+    return { done: false, noPoints: false };
+  }
+  let entries = [];
+  function scan() {
+    const found = new Map();
+    for (const anchor of qa(document, 'a[href]')) {
+      if (panel.contains(anchor)) continue;
+      const info = parseSection(anchor.href);
+      if (!info) continue;
+      const state = tocState(anchor);
+      const name = clean(anchor.textContent).replace(/^\d+\.\d+\s*/, '').slice(0, 85);
+      const item = { ...info, label: `${info.num} ${name || 'Section'}`, done: state.done, noPoints: state.noPoints };
+      const old = found.get(info.num);
+      if (!old || (!old.done && item.done)) found.set(info.num, item);
+    }
+    // Current section can be selected even when TOC links aren't visible.
+    const here = parseSection(location.href);
+    if (here && !found.has(here.num)) found.set(here.num, { ...here, label: `${here.num} (current)`, done: false, noPoints: false });
+    entries = [...found.values()].sort((a, b) => a.ch - b.ch || a.sec - b.sec);
+    list.replaceChildren();
+    if (!entries.length) { list.textContent = 'No section links found. Expand the TOC or type section numbers below.'; return; }
+    for (const chapter of [...new Set(entries.map(e => e.ch))]) {
+      const group = document.createElement('div');
+      group.style.cssText = 'border-bottom:1px solid #43546a;padding:3px 0';
+      const heading = document.createElement('label');
+      const check = document.createElement('input'); check.type = 'checkbox';
+      heading.append(check, ` Chapter ${chapter}`); heading.style.fontWeight = 'bold';
+      group.appendChild(heading);
+      const children = [];
+      for (const e of entries.filter(x => x.ch === chapter)) {
+        const row = document.createElement('label'); row.style.cssText = 'display:block;margin:3px 0 3px 15px';
+        const box = document.createElement('input'); box.type = 'checkbox'; box.dataset.section = e.num;
+        box.checked = !e.done && !e.noPoints;
+        children.push(box);
+        const badge = e.done ? ' ✓ 100%' : (e.noPoints ? ' (no points)' : '');
+        row.append(box, ' ', `${e.label}${badge}`); group.appendChild(row);
+      }
+      check.onchange = () => children.forEach(c => c.checked = check.checked);
+      list.appendChild(group);
+    }
+    log(`Found ${entries.length} section links. The TOC may need expanding to show others.`);
+  }
+  $('scan').onclick = scan;
+  $('all').onclick = () => qa(list, 'input[data-section]').forEach(b => {
+    const e = entries.find(x => x.num === b.dataset.section);
+    b.checked = !!e && !e.done && !e.noPoints;
   });
-}
+  $('none').onclick = () => qa(list, 'input[type=checkbox]').forEach(b => { b.checked = false; });
+  scan();
 
-// ---------- Multiple choice / True-False ----------
-
-async function tryChoices(activity, chapterSection, i) {
-  const questions = activity.locator(
-    '.multiple-choice-question'
-  );
-
-  for (
-    let q = 0;
-    q < await questions.count() && !ctl.stop;
-    q++
-  ) {
-    if ((await status(activity)).complete) return;
-
-    const question = questions.nth(q);
-
-    const meta = await question.evaluate(el => ({
-      correct: !!el.querySelector(
-        '.zb-explanation.correct, .message.correct, ' +
-        '[aria-label="Question completed"]'
-      ),
-      incorrect: !!el.querySelector(
-        '.zb-explanation.incorrect, .message.incorrect'
-      ),
-      checked: [...el.querySelectorAll(
-        'input[type="radio"]'
-      )].findIndex(x => x.checked),
-      fingerprint:
-        el.querySelector(
-          '.question-text,.question-stem,.question-prompt'
-        )?.textContent?.trim() ||
-        [...el.querySelectorAll('input[type="radio"]')]
-          .map(x => x.parentElement?.textContent).join('|'),
-      count: el.querySelectorAll('input[type="radio"]').length
-    }));
-
-    if (meta.correct || !meta.count) continue;
-
-    const k =
-      `${chapterSection}|a${i}|mc${q}|` +
-      keyHash(meta.fingerprint);
-
-    if (meta.checked >= 0) {
-      if (meta.incorrect) {
-        saveWrong(k, meta.checked);
-      } else {
-        console.log(
-          'MC question has an unverified selection; review.'
-        );
-        continue;
+  function selectedSections() {
+    const chosen = new Map();
+    for (const b of qa(list, 'input[data-section]:checked')) {
+      const e = entries.find(x => x.num === b.dataset.section);
+      if (e) chosen.set(e.num, e);
+    }
+    const manual = clean($('manual').value).split(/[,;\n]+/).map(x => x.trim()).filter(Boolean);
+    for (const item of manual) {
+      const m = item.match(/^(\d+)\.(\d+)(?:\s*-\s*(?:(\d+)\.)?(\d+))?$/);
+      if (!m) throw Error(`Invalid section range: ${item}`);
+      const ch = +m[1], from = +m[2], to = m[4] ? +m[4] : from;
+      if (m[3] && +m[3] !== ch) throw Error('Ranges must stay within one chapter');
+      if (ch < 1 || from < 1 || to < from || to - from > 35) throw Error(`Invalid section range: ${item}`);
+      for (let s = from; s <= to; s++) {
+        const num = `${ch}.${s}`;
+        chosen.set(num, entries.find(x => x.num === num) || { ch, sec: s, num, label: num, url: `${root}/chapter/${ch}/section/${s}`, done: false, noPoints: false });
       }
     }
+    const result = [...chosen.values()].sort((a, b) => a.ch - b.ch || a.sec - b.sec);
+    if (!result.length || result.length > 80) throw Error('Select 1 to 80 sections.');
+    return result;
+  }
 
-    for (
-      let opt = 0;
-      opt < meta.count && !ctl.stop;
-      opt++
-    ) {
-      if (wasWrong(k, opt)) continue;
+  // Completion and feedback. Only live page evidence may establish success.
+  function success(node) {
+    return !!q(node, '.zb-explanation.correct, .message.correct, [aria-label="Question completed"]') ||
+      qa(node, '.message').some(e => visible(e) && /^correct[!.]?$/i.test(clean(e.textContent)));
+  }
+  function failure(node) {
+    return !!q(node, '.zb-explanation.incorrect, .message.incorrect') ||
+      qa(node, '.message, .zb-explanation').some(e => visible(e) && /^(incorrect|wrong|try again|not quite)\b/i.test(clean(e.textContent)));
+  }
+  const targets = act => qa(act, D);
+  function populated(t) { return !!q(t, '.term-bucket.populated, .draggable-object'); }
+  function rowFeedback(t) {
+    const r = t.parentElement || t;
+    const good = populated(t) && (!!q(r, '.correct, [aria-label="Question completed"]') || /\bcorrect[!.]?\b/i.test(clean(q(r, '.message')?.textContent)));
+    const bad = !good && (!!q(r, '.incorrect') || /\b(?:incorrect|wrong|try again)\b/i.test(clean(q(r, '.message')?.textContent)));
+    return { good, bad, occupied: populated(t), label: clean(q(t, '.draggable-object')?.textContent) };
+  }
+  function completed(act) {
+    const checks = qa(act, '.zb-chevron');
+    const marked = !!q(act, '[aria-label="Activity completed"]') || (checks.length > 0 && checks.every(e => e.classList.contains('filled')));
+    if (!marked) return false;
+    if (qa(act, '.multiple-choice-question, .short-answer-question').some(n => failure(n) && !success(n))) return false;
+    if (targets(act).some(t => !rowFeedback(t).occupied || rowFeedback(t).bad)) return false;
+    return true;
+  }
+  function review(what) { runner.stats.reviews++; log(`Review: ${what}`); }
 
-      await question.locator(
-        'input[type="radio"]'
-      ).nth(opt).evaluate(el => el.click());
-
-      ctl.actions++;
-      await wait(520);
-
-      const current = (await status(activity)).questions[q];
-
-      if (
-        current?.correct ||
-        (await status(activity)).complete
-      ) {
-        break;
-      }
-
-      if (current?.incorrect) {
-        saveWrong(k, opt);
-      } else {
-        console.log(
-          'MC feedback not recognized; stopping retries here.'
-        );
-        break;
+  async function choices(act, prefix) {
+    const questions = qa(act, '.multiple-choice-question');
+    for (const [i, question] of questions.entries()) {
+      await proceed();
+      if (completed(act) || success(question)) continue;
+      const options = qa(question, 'input[type="radio"]').filter(x => !x.disabled);
+      if (!options.length) continue;
+      const prompt = clean(q(question, '.question-text, .question-stem, .question-prompt')?.textContent);
+      const signature = hash(JSON.stringify([prompt, options.map(x => clean(x.closest('label')?.textContent || x.parentElement?.textContent || x.value))]));
+      const id = `${prefix}/choice/${i}/${signature}`;
+      const selected = options.findIndex(x => x.checked);
+      if (selected >= 0 && failure(question)) remember(id, selected);
+      if (selected >= 0 && !failure(question)) { review(`${prefix} question ${i + 1}: existing selection unverified`); continue; }
+      for (let j = 0; j < options.length; j++) {
+        await proceed();
+        if (rejected(id, j)) continue;
+        options[j].click(); runner.stats.actions++;
+        await sleep(480);
+        if (success(question) || completed(act)) break;
+        if (failure(question)) remember(id, j);
+        else { review(`${prefix} question ${i + 1}: correctness feedback unavailable`); break; }
       }
     }
   }
-}
-
-// ---------- Short answers ----------
-
-async function tryShortAnswers(activity) {
-  const questions = activity.locator(
-    '.short-answer-question'
-  );
-
-  for (
-    let i = 0;
-    i < await questions.count() && !ctl.stop;
-    i++
-  ) {
-    if ((await status(activity)).complete) return;
-
-    const q = questions.nth(i);
-
-    const already = await q.evaluate(el =>
-      !!el.querySelector(
-        '.zb-explanation.correct,.message.correct,' +
-        '[aria-label="Question completed"]'
-      )
-    );
-
-    if (already) continue;
-
-    const input = q.locator(
-      'textarea,input[type="text"]'
-    ).first();
-
-    const check = q.locator(
-      'button.check-button'
-    ).first();
-
-    if (
-      !(await input.count()) ||
-      !(await check.count())
-    ) {
-      continue;
+  async function shortAnswers(act, prefix) {
+    for (const [i, question] of qa(act, '.short-answer-question').entries()) {
+      await proceed();
+      if (completed(act) || success(question)) continue;
+      const input = q(question, 'textarea, input[type="text"]');
+      const submit = q(question, 'button.check-button');
+      const show = q(question, 'button.show-answer-button');
+      if (!input || !submit || submit.disabled) continue;
+      let answer = q(question, '.forfeit-answer');
+      for (let j = 0; !answer && j < 2 && show && !show.disabled; j++) {
+        show.click(); runner.stats.actions++; await sleep(250);
+        answer = q(question, '.forfeit-answer');
+      }
+      if (!answer || !clean(answer.textContent)) { review(`${prefix} short answer ${i + 1}: unavailable`); continue; }
+      const view = input.ownerDocument.defaultView;
+      const proto = input instanceof view.HTMLTextAreaElement ? view.HTMLTextAreaElement.prototype : view.HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, 'value').set.call(input, clean(answer.textContent));
+      input.dispatchEvent(new view.Event('input', { bubbles: true }));
+      input.dispatchEvent(new view.Event('change', { bubbles: true }));
+      submit.click(); runner.stats.actions++;
+      await sleep(500);
+      if (!success(question) && !completed(act)) review(`${prefix} short answer ${i + 1}: not verified`);
     }
+  }
+  async function animations(act) {
+    for (const control of qa(act, '.animation-controls')) {
+      for (const speed of qa(control, '.speed-control input[type="checkbox"]')) {
+        if (!speed.checked && !speed.disabled && visible(speed)) { speed.click(); runner.stats.actions++; }
+      }
+      for (let step = 0; step < 36 && !completed(act); step++) {
+        await proceed();
+        if (q(control, 'button[aria-label="Play again"]')) break;
+        const pause = q(control, 'button[aria-label="Pause"]');
+        if (pause && visible(pause)) { await sleep(480); continue; }
+        const play = q(control, 'button[aria-label="Play"]') || q(control, 'button.start-button');
+        if (!play || !visible(play) || play.disabled) break;
+        play.click(); runner.stats.actions++; await sleep(500);
+      }
+    }
+  }
 
-    let text = await q.locator(
-      '.forfeit-answer'
-    ).first().textContent().catch(() => null);
-
-    if (!text) {
-      const reveal = q.locator(
-        'button.show-answer-button'
-      ).first();
-
-      if (await reveal.count()) {
-        for (let t = 0; t < 2 && !text; t++) {
-          await reveal.evaluate(el => el.click());
-          ctl.actions++;
-          await wait(350);
-
-          text = await q.locator(
-            '.forfeit-answer'
-          ).first().textContent().catch(() => null);
+  // Console-only synthetic drag. Check for an actual DOM move after each attempt.
+  // Browser security prevents events dispatched here from being trusted mouse input.
+  function syntheticDrag(source, destination, mode) {
+    const view = source.ownerDocument.defaultView;
+    const transfer = typeof view.DataTransfer === 'function' ? new view.DataTransfer() : {
+      data: {}, setData(t, v) { this.data[t] = v; }, getData(t) { return this.data[t] || ''; }, clearData() { this.data = {}; }, effectAllowed: 'all', dropEffect: 'move', types: []
+    };
+    const fire = (el, type) => {
+      let event;
+      try { event = new view.DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: transfer }); }
+      catch {
+        event = new view.CustomEvent(type, { bubbles: true, cancelable: true });
+        Object.defineProperty(event, 'dataTransfer', { value: transfer });
+      }
+      el.dispatchEvent(event);
+    };
+    if (mode === 0) {
+      fire(source, 'dragstart'); fire(destination, 'dragenter'); fire(destination, 'dragover');
+      fire(destination, 'drop'); fire(source, 'dragend');
+    } else {
+      // A legacy zyBooks handler may expect the source's drop event first.
+      fire(source, 'dragstart'); fire(source, 'drop'); fire(destination, 'drop'); fire(source, 'dragend');
+    }
+  }
+  async function matching(act, prefix) {
+    if (!$('match').checked || !targets(act).length || completed(act)) return;
+    const tileNames = [...new Set(qa(act, T).map(t => clean(t.textContent)).filter(Boolean))];
+    if (tileNames.length !== targets(act).length) { review(`${prefix}: ambiguous matching tiles`); return; }
+    for (const tileName of tileNames) {
+      await proceed();
+      if (completed(act)) return;
+      const tileIsCorrect = () => targets(act).some(t => rowFeedback(t).good && rowFeedback(t).label === tileName);
+      if (tileIsCorrect()) continue;
+      const id = `${prefix}/match/${hash(tileName)}`;
+      let found = false;
+      for (let i = 0; i < targets(act).length; i++) {
+        await proceed();
+        if (tileIsCorrect()) { found = true; break; }
+        const target = targets(act)[i];
+        const row = rowFeedback(target);
+        if (row.good || rejected(id, i)) continue;
+        // Can move a tile out of a wrong row, but not overwrite another tile.
+        if (row.occupied) {
+          if (row.label === tileName && row.bad) remember(id, i);
+          continue;
         }
-      }
-    }
-
-    if (!text || !norm(text)) {
-      console.log('Short answer unavailable; review.');
-      continue;
-    }
-
-    await input.fill(norm(text));
-    await check.evaluate(el => el.click());
-
-    ctl.actions++;
-    await wait(500);
-  }
-}
-
-// ---------- Animations ----------
-
-async function tryAnimations(activity) {
-  const controls = activity.locator(
-    '.animation-controls'
-  );
-
-  for (
-    let c = 0;
-    c < await controls.count() && !ctl.stop;
-    c++
-  ) {
-    const control = controls.nth(c);
-
-    for (let step = 0; step < 35 && !ctl.stop; step++) {
-      if ((await status(activity)).complete) break;
-
-      const state = await control.evaluate(el => {
-        const visible = e =>
-          e && e.getClientRects().length > 0;
-
-        const speed = [...el.querySelectorAll(
-          '.speed-control input[type="checkbox"]'
-        )].find(x =>
-          visible(x) && !x.checked && !x.disabled
-        );
-
-        const start = [...el.querySelectorAll(
-          'button.start-button'
-        )].find(x =>
-          visible(x) && !x.disabled
-        );
-
-        const pause = [...el.querySelectorAll(
-          'button[aria-label="Pause"]'
-        )].some(visible);
-
-        const play = [...el.querySelectorAll(
-          'button[aria-label="Play"]'
-        )].find(x =>
-          visible(x) && !x.disabled
-        );
-
-        const replay = [...el.querySelectorAll(
-          'button[aria-label="Play again"]'
-        )].some(visible);
-
-        speed?.click();
-
-        if (replay) return 'done';
-        if (pause) return 'playing';
-
-        if (start) {
-          start.click();
-          return 'clicked';
-        }
-
-        if (play) {
-          play.click();
-          return 'clicked';
-        }
-
-        return 'idle';
-      });
-
-      if (state === 'clicked') ctl.actions++;
-
-      if (
-        state === 'idle' ||
-        state === 'done'
-      ) {
-        break;
-      }
-
-      await wait(
-        state === 'playing' ? 750 : 450
-      );
-    }
-  }
-}
-
-// ---------- Real mouse dragging ----------
-
-async function drag(page, src, dst) {
-  await src.scrollIntoViewIfNeeded();
-  await dst.scrollIntoViewIfNeeded();
-
-  const a = await src.boundingBox();
-  const b = await dst.boundingBox();
-
-  if (!a || !b) {
-    throw Error('Draggable tile or target is hidden.');
-  }
-
-  await page.mouse.move(
-    a.x + a.width / 2,
-    a.y + a.height / 2
-  );
-
-  await page.mouse.down();
-  await wait(120);
-
-  await page.mouse.move(
-    b.x + b.width / 2,
-    b.y + b.height / 2,
-    { steps: 24 }
-  );
-
-  await wait(150);
-  await page.mouse.up();
-  await wait(550);
-
-  ctl.actions++;
-}
-
-async function sourceFor(activity, label) {
-  const index = await activity.locator(TILE).evaluateAll(
-    (nodes, label) => nodes.findIndex(el => {
-      const text = el.textContent
-        .replace(/\s+/g, ' ').trim();
-
-      const target = el.closest(
-        '.definition-drag-container'
-      );
-
-      return (
-        text === label &&
-        !target?.parentElement?.querySelector('.correct')
-      );
-    }),
-    label
-  );
-
-  return index < 0
-    ? null
-    : activity.locator(TILE).nth(index);
-}
-
-async function place(page, activity, label, index) {
-  const src = await sourceFor(activity, label);
-
-  if (!src) {
-    throw Error(`Could not find blue tile: ${label}`);
-  }
-
-  const dst = activity.locator(TARGET).nth(index);
-
-  await drag(page, src, dst);
-
-  let row = (await status(activity)).rows[index];
-
-  if (!row?.occupied) {
-    const retrySource = await sourceFor(
-      activity,
-      label
-    );
-
-    if (retrySource) {
-      try {
-        await retrySource.dragTo(dst, {
-          timeout: 5000,
-          force: true
+        const source = qa(act, T).find(t => {
+          if (clean(t.textContent) !== tileName) return false;
+          const old = t.closest(D);
+          return !old || !rowFeedback(old).good;
         });
-      } catch {}
-
-      await wait(500);
-      row = (await status(activity)).rows[index];
-    }
-  }
-
-  if (!row?.occupied) {
-    throw Error(
-      'Drag was not registered by zyBooks.'
-    );
-  }
-
-  if (row.label && row.label !== label) {
-    throw Error(
-      'A different tile landed in the box.'
-    );
-  }
-
-  return row;
-}
-
-// ---------- Matching feedback ----------
-
-async function checkMatching(activity) {
-  const buttons = activity.locator('button').filter({
-    hasText: /^(check|submit|check answer)$/i
-  });
-
-  for (let i = 0; i < await buttons.count(); i++) {
-    const b = buttons.nth(i);
-
-    const relevant = await b.evaluate(el =>
-      !el.closest(
-        '.short-answer-question, .multiple-choice-question'
-      ) &&
-      !el.disabled &&
-      el.getClientRects().length > 0
-    );
-
-    if (relevant) {
-      await b.click();
-      ctl.actions++;
-      await wait(550);
-      return;
-    }
-  }
-}
-
-// ---------- Drag-and-drop matching ----------
-
-async function tryMatching(
-  page,
-  activity,
-  section,
-  activityNumber
-) {
-  if (!(await activity.locator(TARGET).count())) {
-    return;
-  }
-
-  let st = await status(activity);
-
-  if (st.complete) return;
-
-  const labels = await activity.locator(TILE).evaluateAll(
-    nodes => nodes.map(n =>
-      n.textContent.replace(/\s+/g, ' ').trim()
-    ).filter(Boolean)
-  );
-
-  const n = st.rows.length;
-
-  if (
-    labels.length !== n ||
-    new Set(labels).size !== labels.length
-  ) {
-    console.warn(
-      'Matching: ambiguous/missing tile labels; review.'
-    );
-    return;
-  }
-
-  const solved = new Map();
-
-  st.rows.forEach((r, i) => {
-    if (r.good && r.label) {
-      solved.set(r.label, i);
-    }
-  });
-
-  // Move a tile out of an incorrect box and into an
-  // available box. Leave confirmed correct tiles alone.
-
-  for (const label of labels) {
-    if (ctl.stop || solved.has(label)) {
-      continue;
-    }
-
-    const historyKey =
-      `${section}|a${activityNumber}|match|` +
-      keyHash(label);
-
-    let matched = false;
-
-    for (
-      let index = 0;
-      index < n && !ctl.stop;
-      index++
-    ) {
-      st = await status(activity);
-
-      if (st.complete) return;
-
-      const row = st.rows[index];
-
-      // Never displace a verified correct match.
-      if (row.good) continue;
-
-      if (row.occupied) {
-        if (
-          row.label === label &&
-          row.bad
-        ) {
-          saveWrong(historyKey, index);
+        if (!source) break;
+        let moved = false;
+        for (let mode = 0; mode < 2; mode++) {
+          syntheticDrag(source, target, mode); runner.stats.actions++;
+          await sleep(350);
+          const result = rowFeedback(target);
+          if (result.occupied && result.label === tileName) { moved = true; break; }
         }
-
-        continue;
-      }
-
-      if (wasWrong(historyKey, index)) {
-        continue;
-      }
-
-      const after = await place(
-        page,
-        activity,
-        label,
-        index
-      );
-
-      if (after.good) {
-        solved.set(label, index);
-        matched = true;
-        break;
-      }
-
-      if (after.bad) {
-        saveWrong(historyKey, index);
-        continue;
-      }
-
-      // If feedback is not immediately available,
-      // don't assume that the match is wrong.
-    }
-
-    if (!matched) {
-      await checkMatching(activity);
-
-      st = await status(activity);
-
-      if (st.complete) return;
-
-      st.rows.forEach((r, idx) => {
-        if (r.good && r.label) {
-          solved.set(r.label, idx);
-        }
-
-        if (r.bad && r.label) {
-          saveWrong(
-            `${section}|a${activityNumber}|match|` +
-              keyHash(r.label),
-            idx
-          );
-        }
-      });
-
-      if (!solved.has(label)) {
-        console.warn(
-          `Matching: no verified correct placement ` +
-          `for "${label}". Review.`
-        );
+        if (!moved) { review(`${prefix}: browser rejected synthetic dragging. Drag tiles manually.`); return; }
+        const result = rowFeedback(target);
+        if (result.good) { found = true; break; }
+        if (result.bad) { remember(id, i); continue; }
+        review(`${prefix}: tile moved but correctness could not be verified`);
         return;
       }
+      if (!found && !tileIsCorrect()) { review(`${prefix}: no confirmed correct match for ${tileName}`); return; }
     }
   }
 
-  if (!(await status(activity)).complete) {
-    console.warn(
-      'Matching tiles handled; completion not confirmed.'
-    );
+  async function processDocument(doc, section) {
+    const acts = qa(doc, A);
+    if (!acts.length) { log(`${section.num}: no participation activities found.`); return { complete: 0, total: 0 }; }
+    let count = 0;
+    for (const [i, act] of acts.entries()) {
+      await proceed();
+      const prefix = `${section.num}/activity${i + 1}`;
+      if (completed(act)) { runner.stats.skippedActivities++; count++; continue; }
+      log(`${section.num}: activity ${i + 1}/${acts.length}`);
+      await choices(act, prefix);
+      await shortAnswers(act, prefix);
+      await animations(act);
+      await matching(act, prefix);
+      if (completed(act)) { count++; runner.stats.complete++; }
+      else review(`${prefix}: incomplete or no recognizable completion marker`);
+    }
+    return { complete: count, total: acts.length };
   }
-}
 
-// ---------- Process one section ----------
-
-async function runSection(
-  page,
-  entry,
-  sequence,
-  total
-) {
-  const url = entry.url;
-
-  console.log(
-    `\n[${sequence}/${total}] ${entry.label || url}`
-  );
-
-  await page.goto(url, {
-    waitUntil: 'domcontentloaded',
-    timeout: 30000
-  });
-
-  await wait(900);
-  await attachProgressPanel(page);
-
-  const activities = page.locator(ACTIVITY);
-
-  try {
-    await activities.first().waitFor({
-      timeout: 12000
+  // Same-origin iframe keeps the picker and queue alive when section URLs load.
+  async function openInFrame(section) {
+    if (!frame) {
+      frame = document.createElement('iframe');
+      frame.id = 'zy-v6-frame';
+      frame.title = 'zyBooks selected section';
+      frame.style.cssText = 'position:fixed;z-index:2147483646;left:10px;top:10px;width:calc(100vw - 390px);height:92vh;min-width:350px;background:white;border:2px solid #375a85;border-radius:8px';
+      document.body.appendChild(frame);
+    }
+    frame.style.display = 'block';
+    let loaded = false;
+    const waiter = new Promise(resolve => {
+      frame.onload = () => { loaded = true; resolve(true); };
+      setTimeout(() => resolve(false), 11000);
     });
-  } catch {
-    return {
-      url,
-      completed: 0,
-      total: 0,
-      note: 'No participation activities detected'
-    };
+    frame.src = section.url;
+    await waiter;
+    if (!loaded) throw Error('Section viewer did not load');
+    // Some servers disallow iframe embedding, even for the same origin.
+    for (let retry = 0; retry < 24; retry++) {
+      await proceed();
+      let doc;
+      try { doc = frame.contentDocument; } catch { throw Error('Section iframe inaccessible'); }
+      if (!doc?.body || doc.location?.href === 'about:blank') { await sleep(250); continue; }
+      if (q(doc, A)) return doc;
+      if (retry === 23) {
+        const text = clean(doc.body.innerText).slice(0, 180);
+        if (/refused|blocked|not allowed|sign in|log in/i.test(text)) throw Error(`Iframe blocked or needs login: ${text}`);
+        return doc;
+      }
+      await sleep(250);
+    }
+    throw Error('Unable to inspect section iframe');
   }
 
-  const count = await activities.count();
-
-  for (
-    let i = 0;
-    i < count && !ctl.stop;
-    i++
-  ) {
-    const activity = activities.nth(i);
-
-    // Live completion check before any interaction.
-    if ((await status(activity)).complete) {
-      ctl.skipped++;
-      continue;
+  // Optional fallback: click the site's real TOC link. This only preserves
+  // Console state when its router keeps the document alive (SPA navigation).
+  async function navigateWithTOC(section) {
+    const anchor = qa(document, 'a[href]').find(a => parseSection(a.href)?.num === section.num && !panel.contains(a));
+    if (!anchor) throw Error('No visible/loaded TOC link for SPA fallback');
+    if (frame) frame.style.display = 'none';
+    anchor.click();
+    let ok = false;
+    for (let i = 0; i < 36; i++) {
+      await proceed();
+      if (parseSection(location.href)?.num === section.num && q(document, A)) {
+        ok = true;
+        break;
+      }
+      await sleep(250);
     }
+    if (!ok) throw Error('TOC navigation did not reveal the requested section');
+    await sleep(450);
+    return document;
+  }
 
+  async function runQueue(sections) {
+    if (runner.busy) { log('Already running.'); return; }
+    runner.busy = true;
+    runner.stopped = false;
+    runner.paused = false;
+    runner.results = [];
+    log(`Starting ${sections.length} selected section(s).`);
     try {
-      await tryChoices(activity, url, i);
-      await tryShortAnswers(activity);
-      await tryAnimations(activity);
-      await tryMatching(page, activity, url, i);
-    } catch (error) {
-      console.warn(
-        `Activity ${i + 1} needs review: ${error.message}`
-      );
-    }
-
-    const done = (await status(activity)).complete;
-
-    console.log(
-      `Activity ${i + 1}/${count}: ` +
-      (done ? 'complete' : 'not verified')
-    );
-
-    await updateProgressPanel(
-      page,
-      `${sequence}/${total} sections · ` +
-      `activity ${i + 1}/${count} · ` +
-      `${ctl.actions} actions`
-    );
-  }
-
-  let completed = 0;
-
-  for (let i = 0; i < count; i++) {
-    if ((await status(activities.nth(i))).complete) {
-      completed++;
-    }
-  }
-
-  return {
-    url,
-    completed,
-    total: count,
-    note: ctl.stop ? 'Stopped' : 'Checked'
-  };
-}
-
-// ---------- Progress overlay ----------
-
-async function attachProgressPanel(page) {
-  await page.evaluate(() => {
-    document.getElementById(
-      'zy-v5-progress'
-    )?.remove();
-
-    const box = document.createElement('aside');
-
-    box.id = 'zy-v5-progress';
-
-    box.style.cssText =
-      'position:fixed;right:16px;bottom:16px;' +
-      'z-index:2147483647;background:#192638;' +
-      'color:white;border-radius:10px;padding:14px;' +
-      'box-shadow:0 4px 20px #0005;' +
-      'font:13px system-ui;max-width:310px';
-
-    box.innerHTML =
-      '<b>zyBooks Section Runner</b>' +
-      '<div id="zy-v5-status" ' +
-      'style="margin:8px 0">Working…</div>';
-
-    const button = document.createElement('button');
-
-    button.textContent = 'Stop after current action';
-
-    button.onclick = () => window.zyStopRunner();
-
-    box.appendChild(button);
-    document.body.appendChild(box);
-  });
-}
-
-async function updateProgressPanel(page, text) {
-  try {
-    await page.evaluate(text => {
-      const el = document.getElementById(
-        'zy-v5-status'
-      );
-
-      if (el) el.textContent = text;
-    }, text);
-  } catch {}
-}
-
-// ---------- Chapter/section picker ----------
-
-async function showPicker(page) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      await page.exposeFunction(
-        'zyStartRunner',
-        selection => resolve(selection)
-      );
-
-      await page.evaluate(({ course, root }) => {
-        document.getElementById(
-          'zy-v5-picker'
-        )?.remove();
-
-        const panel = document.createElement('aside');
-
-        panel.id = 'zy-v5-picker';
-
-        panel.style.cssText =
-          'position:fixed;right:15px;top:65px;' +
-          'z-index:2147483647;width:360px;' +
-          'max-width:calc(100vw - 30px);' +
-          'max-height:80vh;overflow:auto;' +
-          'background:#15253a;color:white;' +
-          'border:1px solid #49617b;padding:16px;' +
-          'border-radius:12px;' +
-          'box-shadow:0 6px 30px #0008;' +
-          'font:13px system-ui';
-
-        const heading = document.createElement('h3');
-
-        heading.textContent =
-          'zyBooks Section Runner v5';
-
-        heading.style.margin = '0 0 8px';
-        panel.appendChild(heading);
-
-        const help = document.createElement('p');
-
-        help.textContent =
-          'Choose chapters or sections, then Start. ' +
-          'Only participation activities will be processed.';
-
-        panel.appendChild(help);
-
-        const controls = document.createElement('div');
-        const list = document.createElement('div');
-
-        list.style.cssText =
-          'max-height:38vh;overflow:auto;' +
-          'border:1px solid #42566c;padding:8px';
-
-        const input = document.createElement('input');
-
-        input.placeholder =
-          'Optional: 6.1, 6.3, 7.1-7.4';
-
-        input.style.cssText =
-          'width:100%;margin:10px 0;' +
-          'padding:7px;box-sizing:border-box';
-
-        const info = document.createElement('div');
-
-        info.style.cssText =
-          'margin:6px 0;color:#c9d4e6';
-
-        const mkButton = (caption, fn) => {
-          const b = document.createElement('button');
-
-          b.textContent = caption;
-
-          b.style.cssText =
-            'margin:3px;padding:6px;cursor:pointer';
-
-          b.addEventListener('click', fn);
-          controls.appendChild(b);
-        };
-
-        let entries = [];
-
-        function scan() {
-          const found = new Map();
-
-          for (
-            const anchor of document.querySelectorAll(
-              'a[href]'
-            )
-          ) {
-            let url;
-
-            try {
-              url = new URL(anchor.href);
-            } catch {
-              continue;
-            }
-
-            const m = url.pathname.match(
-              /\/chapter\/(\d+)\/section\/(\d+)\/?$/
-            );
-
-            if (
-              !m ||
-              url.origin !== 'https://learn.zybooks.com' ||
-              !url.pathname.startsWith(
-                `/zybook/${course}/`
-              )
-            ) {
-              continue;
-            }
-
-            const ch = Number(m[1]);
-            const sec = Number(m[2]);
-
-            found.set(`${ch}.${sec}`, {
-              ch,
-              sec,
-              url: `${root}/chapter/${ch}/section/${sec}`,
-              label:
-                `${ch}.${sec} — ` +
-                (anchor.textContent.trim() || 'Section')
-            });
-          }
-
-          entries = [...found.values()].sort(
-            (a, b) =>
-              a.ch - b.ch ||
-              a.sec - b.sec
-          );
-
-          list.replaceChildren();
-
-          const groups = new Map();
-
-          for (const entry of entries) {
-            if (!groups.has(entry.ch)) {
-              groups.set(entry.ch, []);
-            }
-
-            groups.get(entry.ch).push(entry);
-          }
-
-          for (const [chapter, members] of groups) {
-            const section = document.createElement('div');
-
-            section.style.cssText =
-              'margin:6px 0;' +
-              'border-bottom:1px solid #40516a';
-
-            const chLabel = document.createElement('label');
-            const chBox = document.createElement('input');
-
-            chBox.type = 'checkbox';
-
-            chLabel.append(
-              chBox,
-              ` Chapter ${chapter} (${members.length} sections)`
-            );
-
-            chLabel.style.fontWeight = 'bold';
-            section.appendChild(chLabel);
-
-            const checks = [];
-
-            for (const entry of members) {
-              const label = document.createElement('label');
-
-              label.style.cssText =
-                'display:block;margin:4px 0 4px 14px';
-
-              const checkbox = document.createElement('input');
-
-              checkbox.type = 'checkbox';
-              checkbox.className = 'zy-v5-choice';
-              checkbox.dataset.url = entry.url;
-              checkbox.dataset.label = entry.label;
-
-              label.append(
-                checkbox,
-                ` ${entry.label}`
-              );
-
-              section.appendChild(label);
-              checks.push(checkbox);
-            }
-
-            chBox.addEventListener(
-              'change',
-              () => checks.forEach(
-                c => c.checked = chBox.checked
-              )
-            );
-
-            list.appendChild(section);
-          }
-
-          info.textContent =
-            `Detected ${entries.length} linked sections. ` +
-            'Expand TOC chapters and press Rescan ' +
-            'if some are missing.';
+      for (const section of sections) {
+        await proceed();
+        runner.current = section.num;
+        if ($('skip').checked && (section.done || section.noPoints)) {
+          runner.stats.skippedSections++;
+          runner.results.push({ section: section.num, result: 'Skipped (TOC 100% / no points)' });
+          log(`${section.num}: skipped based on TOC status.`);
+          continue;
         }
-
-        mkButton('Select all', () =>
-          panel.querySelectorAll(
-            '.zy-v5-choice'
-          ).forEach(x => x.checked = true)
-        );
-
-        mkButton('Clear', () =>
-          panel.querySelectorAll(
-            '.zy-v5-choice'
-          ).forEach(x => x.checked = false)
-        );
-
-        mkButton('Rescan TOC', scan);
-
-        const start = document.createElement('button');
-
-        start.textContent = 'Start selected sections';
-
-        start.style.cssText =
-          'background:#69d7a8;color:#10251e;' +
-          'font-weight:bold;padding:9px 12px;' +
-          'cursor:pointer;border:0;border-radius:6px';
-
-        start.addEventListener('click', async () => {
-          const out = new Map();
-
-          for (
-            const box of panel.querySelectorAll(
-              '.zy-v5-choice:checked'
-            )
-          ) {
-            out.set(box.dataset.url, {
-              url: box.dataset.url,
-              label: box.dataset.label
-            });
-          }
-
-          const manual = input.value
-            .split(/[,;\n]+/)
-            .map(s => s.trim())
-            .filter(Boolean);
-
-          for (const term of manual) {
-            const m = term.match(
-              /^(\d+)\.(\d+)(?:\s*-\s*(\d+))?$/
-            );
-
-            if (!m) {
-              info.textContent =
-                `Invalid manual section: ${term}`;
-              return;
-            }
-
-            const ch = +m[1];
-            const from = +m[2];
-            const to = +(m[3] || m[2]);
-
-            if (
-              ch < 1 ||
-              from < 1 ||
-              to < from ||
-              to - from > 30
-            ) {
-              info.textContent =
-                `Invalid section range: ${term}`;
-              return;
-            }
-
-            for (let s = from; s <= to; s++) {
-              const url =
-                `${root}/chapter/${ch}/section/${s}`;
-
-              out.set(url, {
-                url,
-                label: `${ch}.${s} (manual)`
-              });
+        let doc;
+        try {
+          // Running on the currently displayed section works without iframe.
+          const here = parseSection(location.href);
+          if (here?.num === section.num) {
+            doc = document;
+          } else {
+            try {
+              doc = await openInFrame(section);
+            } catch (embedError) {
+              if (!$('spa').checked) throw embedError;
+              log(`${section.num}: iframe unavailable; trying TOC navigation (may reload).`);
+              doc = await navigateWithTOC(section);
             }
           }
-
-          if (!out.size || out.size > 80) {
-            info.textContent =
-              'Choose 1–80 sections.';
-            return;
-          }
-
-          start.disabled = true;
-          info.textContent = 'Starting...';
-
-          try {
-            await window.zyStartRunner(
-              [...out.values()]
-            );
-          } catch (error) {
-            info.textContent = error.message;
-            start.disabled = false;
-          }
-        });
-
-        panel.append(
-          controls,
-          list,
-          input,
-          info,
-          start
-        );
-
-        document.body.appendChild(panel);
-        scan();
-      }, {
-        course: COURSE,
-        root: ROOT
-      });
-    } catch (error) {
-      reject(error);
-    }
-  });
-}
-
-// ---------- Main ----------
-
-async function main() {
-  const browser = await chromium.launchPersistentContext(
-    PROFILE,
-    {
-      headless: false,
-      viewport: {
-        width: 1400,
-        height: 960
+          const result = await processDocument(doc, section);
+          runner.stats.sections++;
+          runner.results.push({ section: section.num, ...result });
+          log(`${section.num}: ${result.complete}/${result.total} verified complete.`);
+        } catch (err) {
+          if (runner.stopped) break;
+          runner.results.push({ section: section.num, error: err.message });
+          log(`${section.num}: ${err.message}. No reliable console-only cross-section fallback if embedding is blocked.`);
+          // Avoid reporting an entire queue as completed after a framing failure.
+          if (/iframe|viewer|inaccessible/i.test(err.message)) break;
+        }
       }
+    } finally {
+      runner.busy = false;
+      runner.current = null;
+      console.table(runner.results);
+      log('Run finished. See window.zyRunner.summary() for results.');
     }
-  );
-
-  const page =
-    browser.pages()[0] ||
-    await browser.newPage();
-
-  const rl = readline.createInterface({
-    input: stdin,
-    output: stdout
-  });
-
-  await page.exposeFunction(
-    'zyStopRunner',
-    () => {
-      ctl.stop = true;
-    }
-  );
-
-  try {
-    await page.goto(ROOT, {
-      waitUntil: 'domcontentloaded'
-    });
-
-    console.log(
-      'Sign in to zyBooks if prompted. ' +
-      'Navigate to the course TOC.'
-    );
-
-    await rl.question(
-      'When the table of contents is visible, ' +
-      'press ENTER here...'
-    );
-
-    const selected = await showPicker(page);
-
-    const unique = [...new Map(
-      selected
-        .filter(x => validSection(x.url))
-        .map(x => [x.url, x])
-    ).values()];
-
-    if (!unique.length) {
-      throw Error('No valid sections selected.');
-    }
-
-    console.log(
-      `Selected ${unique.length} sections.`
-    );
-
-    for (
-      let i = 0;
-      i < unique.length && !ctl.stop;
-      i++
-    ) {
-      try {
-        ctl.results.push(
-          await runSection(
-            page,
-            unique[i],
-            i + 1,
-            unique.length
-          )
-        );
-      } catch (error) {
-        ctl.results.push({
-          url: unique[i].url,
-          note: error.message
-        });
-
-        console.warn(
-          `Section failed: ${error.message}`
-        );
-      }
-    }
-
-    console.table(ctl.results);
-
-    console.log(
-      `Actions: ${ctl.actions}, ` +
-      `verified activity skips: ${ctl.skipped}`
-    );
-
-    console.log(
-      `Saved feedback-confirmed wrong answers in ${HISTORY}`
-    );
-
-    await updateProgressPanel(
-      page,
-      'Finished. See Terminal summary.'
-    );
-
-    await rl.question(
-      'Press ENTER to close the browser...'
-    );
-  } finally {
-    rl.close();
-    await browser.close();
   }
-}
 
-main().catch(e => {
-  console.error(e);
-  process.exitCode = 1;
-});
+  $('run').onclick = () => {
+    try { runQueue(selectedSections()); } catch (e) { log(e.message); }
+  };
+  $('current').onclick = () => {
+    const here = parseSection(location.href);
+    if (!here) { log('Open a specific chapter section before using Current section.'); return; }
+    runQueue([{ ...here, done: false, noPoints: false, label: here.num }]);
+  };
+  log('Ready. Select sections and click Run selected.');
+})();
