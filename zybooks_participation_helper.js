@@ -1,504 +1,1243 @@
+const { chromium } = require('playwright');
+const fs = require('node:fs');
+const path = require('node:path');
+const readline = require('node:readline/promises');
+const { stdin, stdout } = require('node:process');
+const { createHash } = require('node:crypto');
 
-(async () => {
-  'use strict';
+const COURSE = 'SOUTHEASTERNCMPS2940KoutsougerasFall2026';
+const ROOT = `https://learn.zybooks.com/zybook/${COURSE}`;
 
-  if (location.hostname !== 'learn.zybooks.com') {
-    console.warn('Open learn.zybooks.com before running the helper.');
+const PROFILE = path.join(__dirname, '.zybooks-v5-profile');
+const HISTORY = path.join(__dirname, '.zybooks-v5-history.json');
+
+const ACTIVITY = '.interactive-activity-container.participation';
+const TILE = '.draggable-object';
+const TARGET = '.draggable-object-target.definition-drag-container';
+
+const wait = ms => new Promise(r => setTimeout(r, ms));
+const norm = text => String(text || '').replace(/\s+/g, ' ').trim();
+const keyHash = text =>
+  createHash('sha256').update(text).digest('hex').slice(0, 16);
+
+let wrong = {};
+
+try {
+  wrong = JSON.parse(fs.readFileSync(HISTORY, 'utf8'));
+} catch {}
+
+const saveWrong = (key, index) => {
+  wrong[key] ||= [];
+
+  if (!wrong[key].includes(index)) {
+    wrong[key].push(index);
+    fs.writeFileSync(HISTORY, JSON.stringify(wrong, null, 2));
+  }
+};
+
+const wasWrong = (key, index) =>
+  (wrong[key] || []).includes(index);
+
+const ctl = {
+  stop: false,
+  actions: 0,
+  skipped: 0,
+  results: []
+};
+
+// ---------- Section navigation ----------
+
+function validSection(url) {
+  try {
+    const u = new URL(url);
+
+    return (
+      u.origin === 'https://learn.zybooks.com' &&
+      u.pathname.startsWith(`/zybook/${COURSE}/chapter/`) &&
+      /^\/zybook\/[^/]+\/chapter\/\d+\/section\/\d+$/.test(u.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+// ---------- Completion detection ----------
+
+async function status(activity) {
+  return activity.evaluate(root => {
+    const norm = t =>
+      String(t || '').replace(/\s+/g, ' ').trim();
+
+    const feedback = node => {
+      const correct = Boolean(node.querySelector(
+        '.zb-explanation.correct, .message.correct, ' +
+        '[aria-label="Question completed"]'
+      ));
+
+      const incorrect = Boolean(node.querySelector(
+        '.zb-explanation.incorrect, .message.incorrect'
+      )) || [...node.querySelectorAll(
+        '.message,.zb-explanation'
+      )].some(x =>
+        /^(incorrect|wrong|try again|not quite)\b/i
+          .test(norm(x.textContent))
+      );
+
+      return {
+        correct,
+        incorrect: incorrect && !correct
+      };
+    };
+
+    const targets = [...root.querySelectorAll(
+      '.draggable-object-target.definition-drag-container'
+    )];
+
+    const rows = targets.map(t => {
+      const wrapper = t.parentElement || t;
+      const tile = t.querySelector('.draggable-object');
+
+      const good = Boolean(wrapper.querySelector(
+        '.correct, [aria-label="Question completed"]'
+      ));
+
+      const bad = Boolean(
+        wrapper.querySelector('.incorrect')
+      );
+
+      return {
+        label: norm(tile?.textContent),
+        occupied: Boolean(
+          tile || t.querySelector('.term-bucket.populated')
+        ),
+        good,
+        bad: bad && !good
+      };
+    });
+
+    const questions = [...root.querySelectorAll(
+      '.multiple-choice-question, .short-answer-question'
+    )].map(feedback);
+
+    const chevrons = [...root.querySelectorAll('.zb-chevron')];
+
+    const marked = Boolean(
+      root.querySelector('[aria-label="Activity completed"]')
+    ) || (
+      chevrons.length > 0 &&
+      chevrons.every(el => el.classList.contains('filled'))
+    );
+
+    // A completed activity is never repeated unless live
+    // feedback explicitly contradicts the completion marker.
+    const complete =
+      marked &&
+      rows.every(r => !r.bad) &&
+      questions.every(q => !q.incorrect);
+
+    return {
+      complete,
+      marked,
+      rows,
+      questions
+    };
+  });
+}
+
+// ---------- Multiple choice / True-False ----------
+
+async function tryChoices(activity, chapterSection, i) {
+  const questions = activity.locator(
+    '.multiple-choice-question'
+  );
+
+  for (
+    let q = 0;
+    q < await questions.count() && !ctl.stop;
+    q++
+  ) {
+    if ((await status(activity)).complete) return;
+
+    const question = questions.nth(q);
+
+    const meta = await question.evaluate(el => ({
+      correct: !!el.querySelector(
+        '.zb-explanation.correct, .message.correct, ' +
+        '[aria-label="Question completed"]'
+      ),
+      incorrect: !!el.querySelector(
+        '.zb-explanation.incorrect, .message.incorrect'
+      ),
+      checked: [...el.querySelectorAll(
+        'input[type="radio"]'
+      )].findIndex(x => x.checked),
+      fingerprint:
+        el.querySelector(
+          '.question-text,.question-stem,.question-prompt'
+        )?.textContent?.trim() ||
+        [...el.querySelectorAll('input[type="radio"]')]
+          .map(x => x.parentElement?.textContent).join('|'),
+      count: el.querySelectorAll('input[type="radio"]').length
+    }));
+
+    if (meta.correct || !meta.count) continue;
+
+    const k =
+      `${chapterSection}|a${i}|mc${q}|` +
+      keyHash(meta.fingerprint);
+
+    if (meta.checked >= 0) {
+      if (meta.incorrect) {
+        saveWrong(k, meta.checked);
+      } else {
+        console.log(
+          'MC question has an unverified selection; review.'
+        );
+        continue;
+      }
+    }
+
+    for (
+      let opt = 0;
+      opt < meta.count && !ctl.stop;
+      opt++
+    ) {
+      if (wasWrong(k, opt)) continue;
+
+      await question.locator(
+        'input[type="radio"]'
+      ).nth(opt).evaluate(el => el.click());
+
+      ctl.actions++;
+      await wait(520);
+
+      const current = (await status(activity)).questions[q];
+
+      if (
+        current?.correct ||
+        (await status(activity)).complete
+      ) {
+        break;
+      }
+
+      if (current?.incorrect) {
+        saveWrong(k, opt);
+      } else {
+        console.log(
+          'MC feedback not recognized; stopping retries here.'
+        );
+        break;
+      }
+    }
+  }
+}
+
+// ---------- Short answers ----------
+
+async function tryShortAnswers(activity) {
+  const questions = activity.locator(
+    '.short-answer-question'
+  );
+
+  for (
+    let i = 0;
+    i < await questions.count() && !ctl.stop;
+    i++
+  ) {
+    if ((await status(activity)).complete) return;
+
+    const q = questions.nth(i);
+
+    const already = await q.evaluate(el =>
+      !!el.querySelector(
+        '.zb-explanation.correct,.message.correct,' +
+        '[aria-label="Question completed"]'
+      )
+    );
+
+    if (already) continue;
+
+    const input = q.locator(
+      'textarea,input[type="text"]'
+    ).first();
+
+    const check = q.locator(
+      'button.check-button'
+    ).first();
+
+    if (
+      !(await input.count()) ||
+      !(await check.count())
+    ) {
+      continue;
+    }
+
+    let text = await q.locator(
+      '.forfeit-answer'
+    ).first().textContent().catch(() => null);
+
+    if (!text) {
+      const reveal = q.locator(
+        'button.show-answer-button'
+      ).first();
+
+      if (await reveal.count()) {
+        for (let t = 0; t < 2 && !text; t++) {
+          await reveal.evaluate(el => el.click());
+          ctl.actions++;
+          await wait(350);
+
+          text = await q.locator(
+            '.forfeit-answer'
+          ).first().textContent().catch(() => null);
+        }
+      }
+    }
+
+    if (!text || !norm(text)) {
+      console.log('Short answer unavailable; review.');
+      continue;
+    }
+
+    await input.fill(norm(text));
+    await check.evaluate(el => el.click());
+
+    ctl.actions++;
+    await wait(500);
+  }
+}
+
+// ---------- Animations ----------
+
+async function tryAnimations(activity) {
+  const controls = activity.locator(
+    '.animation-controls'
+  );
+
+  for (
+    let c = 0;
+    c < await controls.count() && !ctl.stop;
+    c++
+  ) {
+    const control = controls.nth(c);
+
+    for (let step = 0; step < 35 && !ctl.stop; step++) {
+      if ((await status(activity)).complete) break;
+
+      const state = await control.evaluate(el => {
+        const visible = e =>
+          e && e.getClientRects().length > 0;
+
+        const speed = [...el.querySelectorAll(
+          '.speed-control input[type="checkbox"]'
+        )].find(x =>
+          visible(x) && !x.checked && !x.disabled
+        );
+
+        const start = [...el.querySelectorAll(
+          'button.start-button'
+        )].find(x =>
+          visible(x) && !x.disabled
+        );
+
+        const pause = [...el.querySelectorAll(
+          'button[aria-label="Pause"]'
+        )].some(visible);
+
+        const play = [...el.querySelectorAll(
+          'button[aria-label="Play"]'
+        )].find(x =>
+          visible(x) && !x.disabled
+        );
+
+        const replay = [...el.querySelectorAll(
+          'button[aria-label="Play again"]'
+        )].some(visible);
+
+        speed?.click();
+
+        if (replay) return 'done';
+        if (pause) return 'playing';
+
+        if (start) {
+          start.click();
+          return 'clicked';
+        }
+
+        if (play) {
+          play.click();
+          return 'clicked';
+        }
+
+        return 'idle';
+      });
+
+      if (state === 'clicked') ctl.actions++;
+
+      if (
+        state === 'idle' ||
+        state === 'done'
+      ) {
+        break;
+      }
+
+      await wait(
+        state === 'playing' ? 750 : 450
+      );
+    }
+  }
+}
+
+// ---------- Real mouse dragging ----------
+
+async function drag(page, src, dst) {
+  await src.scrollIntoViewIfNeeded();
+  await dst.scrollIntoViewIfNeeded();
+
+  const a = await src.boundingBox();
+  const b = await dst.boundingBox();
+
+  if (!a || !b) {
+    throw Error('Draggable tile or target is hidden.');
+  }
+
+  await page.mouse.move(
+    a.x + a.width / 2,
+    a.y + a.height / 2
+  );
+
+  await page.mouse.down();
+  await wait(120);
+
+  await page.mouse.move(
+    b.x + b.width / 2,
+    b.y + b.height / 2,
+    { steps: 24 }
+  );
+
+  await wait(150);
+  await page.mouse.up();
+  await wait(550);
+
+  ctl.actions++;
+}
+
+async function sourceFor(activity, label) {
+  const index = await activity.locator(TILE).evaluateAll(
+    (nodes, label) => nodes.findIndex(el => {
+      const text = el.textContent
+        .replace(/\s+/g, ' ').trim();
+
+      const target = el.closest(
+        '.definition-drag-container'
+      );
+
+      return (
+        text === label &&
+        !target?.parentElement?.querySelector('.correct')
+      );
+    }),
+    label
+  );
+
+  return index < 0
+    ? null
+    : activity.locator(TILE).nth(index);
+}
+
+async function place(page, activity, label, index) {
+  const src = await sourceFor(activity, label);
+
+  if (!src) {
+    throw Error(`Could not find blue tile: ${label}`);
+  }
+
+  const dst = activity.locator(TARGET).nth(index);
+
+  await drag(page, src, dst);
+
+  let row = (await status(activity)).rows[index];
+
+  if (!row?.occupied) {
+    const retrySource = await sourceFor(
+      activity,
+      label
+    );
+
+    if (retrySource) {
+      try {
+        await retrySource.dragTo(dst, {
+          timeout: 5000,
+          force: true
+        });
+      } catch {}
+
+      await wait(500);
+      row = (await status(activity)).rows[index];
+    }
+  }
+
+  if (!row?.occupied) {
+    throw Error(
+      'Drag was not registered by zyBooks.'
+    );
+  }
+
+  if (row.label && row.label !== label) {
+    throw Error(
+      'A different tile landed in the box.'
+    );
+  }
+
+  return row;
+}
+
+// ---------- Matching feedback ----------
+
+async function checkMatching(activity) {
+  const buttons = activity.locator('button').filter({
+    hasText: /^(check|submit|check answer)$/i
+  });
+
+  for (let i = 0; i < await buttons.count(); i++) {
+    const b = buttons.nth(i);
+
+    const relevant = await b.evaluate(el =>
+      !el.closest(
+        '.short-answer-question, .multiple-choice-question'
+      ) &&
+      !el.disabled &&
+      el.getClientRects().length > 0
+    );
+
+    if (relevant) {
+      await b.click();
+      ctl.actions++;
+      await wait(550);
+      return;
+    }
+  }
+}
+
+// ---------- Drag-and-drop matching ----------
+
+async function tryMatching(
+  page,
+  activity,
+  section,
+  activityNumber
+) {
+  if (!(await activity.locator(TARGET).count())) {
     return;
   }
 
-  window.zyPA?.stop?.();
-  document.getElementById('zy-pa-helper')?.remove();
+  let st = await status(activity);
 
-  const OPT = {
-    clickDelayMs: 550,
-    loopDelayMs: 1100,
-    maxRuntimeMs: 5 * 60 * 1000,
-    maxDropsPerActivity: 90,
-    stalledMs: 25000
-  };
-  const route = location.pathname + location.search;
-  const storageKey = 'zyPA-v3-failures:' + route;
-  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-  const clean = value => (value || '').replace(/\s+/g, ' ').trim();
-  const all = (root, selector) => Array.from(root.querySelectorAll(selector));
+  if (st.complete) return;
 
-  function loadFailures() {
-    try {
-      const obj = JSON.parse(sessionStorage.getItem(storageKey) || '{}');
-      return {
-        choices: obj.choices && typeof obj.choices === 'object' ? obj.choices : {},
-        matching: obj.matching && typeof obj.matching === 'object' ? obj.matching : {}
-      };
-    } catch (_) {
-      return { choices: {}, matching: {} };
+  const labels = await activity.locator(TILE).evaluateAll(
+    nodes => nodes.map(n =>
+      n.textContent.replace(/\s+/g, ' ').trim()
+    ).filter(Boolean)
+  );
+
+  const n = st.rows.length;
+
+  if (
+    labels.length !== n ||
+    new Set(labels).size !== labels.length
+  ) {
+    console.warn(
+      'Matching: ambiguous/missing tile labels; review.'
+    );
+    return;
+  }
+
+  const solved = new Map();
+
+  st.rows.forEach((r, i) => {
+    if (r.good && r.label) {
+      solved.set(r.label, i);
     }
-  }
-  const failures = loadFailures();
-  function saveFailures() {
-    try { sessionStorage.setItem(storageKey, JSON.stringify(failures)); }
-    catch (_) { /* Browsers may disable storage. */ }
-  }
-  function failedBefore(category, key, value) {
-    return Array.isArray(failures[category][key]) &&
-      failures[category][key].includes(value);
-  }
-  function rememberFailure(category, key, value) {
-    const list = failures[category][key] ??= [];
-    if (!list.includes(value)) {
-      list.push(value);
-      saveFailures();
-    }
-  }
-
-  const state = {
-    running: true,
-    startedAt: Date.now(),
-    lastActionAt: Date.now(),
-    actions: 0,
-    drops: 0,
-    skippedActivities: new Set(),
-    skippedQuestions: new WeakSet(),
-    skippedQuestionCount: 0,
-    skippedTargets: new WeakSet(),
-    skippedTargetCount: 0,
-    animationStarted: new WeakSet(),
-    shortSubmitted: new WeakSet(),
-    dragTriedThisRun: new Set(),
-    manualNeeded: new Set()
-  };
-
-  const panel = document.createElement('section');
-  panel.id = 'zy-pa-helper';
-  Object.assign(panel.style, {
-    position: 'fixed', right: '16px', bottom: '16px', zIndex: '2147483647',
-    background: '#192839', color: 'white', padding: '14px 16px',
-    borderRadius: '10px', boxShadow: '0 4px 22px #0005',
-    width: '290px', maxWidth: 'calc(100vw - 32px)',
-    font: '13px system-ui', lineHeight: '1.45'
   });
-  panel.innerHTML = `
-    <strong>zyBooks participation helper v3</strong>
-    <div data-status style="white-space:pre-line;margin:9px 0">Checking completion…</div>
-    <button type="button" data-stop style="cursor:pointer;padding:5px 12px">Stop</button>
-  `;
-  document.body.appendChild(panel);
-  const statusElement = panel.querySelector('[data-status]');
-  const stopButton = panel.querySelector('[data-stop]');
-  function status(message) { statusElement.textContent = message; }
-  function stop(message = 'Stopped.') {
-    state.running = false;
-    status(message);
-    stopButton.disabled = true;
-  }
-  function action() {
-    state.actions++;
-    state.lastActionAt = Date.now();
-  }
-  function summary() {
-    const activities = getActivities();
-    return {
-      running: state.running,
-      activities: activities.length,
-      confirmedComplete: activities.filter(activityComplete).length,
-      verifiedActivitySkips: state.skippedActivities.size,
-      verifiedQuestionSkips: state.skippedQuestionCount,
-      verifiedMatchingRowSkips: state.skippedTargetCount,
-      clicksAndDrops: state.actions,
-      matchingDrops: state.drops,
-      reviewActivities: [...state.manualNeeded]
-    };
-  }
-  window.zyPA = {
-    stop,
-    summary,
-    clearHistory() {
-      failures.choices = {};
-      failures.matching = {};
-      try { sessionStorage.removeItem(storageKey); } catch (_) {}
-      console.info('Saved incorrect attempts cleared; rerun the script if needed.');
+
+  // Move a tile out of an incorrect box and into an
+  // available box. Leave confirmed correct tiles alone.
+
+  for (const label of labels) {
+    if (ctl.stop || solved.has(label)) {
+      continue;
     }
-  };
-  stopButton.addEventListener('click', () => stop());
 
-  const getActivities = () => all(document,
-    '.interactive-activity-container.participation'
-  );
-  const getTargets = activity => all(activity,
-    '.draggable-object-target.definition-drag-container'
-  );
-  const getTiles = activity => all(activity, '.draggable-object');
+    const historyKey =
+      `${section}|a${activityNumber}|match|` +
+      keyHash(label);
 
-  function activityComplete(activity) {
-    const explicitDone = Boolean(activity.querySelector('[aria-label="Activity completed"]'));
-    const chevrons = all(activity, '.zb-chevron');
-    const markedDone = explicitDone || (chevrons.length > 0 &&
-      chevrons.every(chevron => chevron.classList.contains('filled')));
-    if (!markedDone) return false;
+    let matched = false;
 
-    // Do not blindly trust the completion badge if live content contradicts it.
-    const questions = all(activity, '.multiple-choice-question, .short-answer-question');
-    if (questions.some(q => feedbackIncorrect(q) && !feedbackCorrect(q))) return false;
-    const targets = getTargets(activity);
-    if (targets.some(t => !targetPopulated(t) ||
-      (targetIncorrect(t) && !targetCorrect(t)))) return false;
-    return true;
-  }
+    for (
+      let index = 0;
+      index < n && !ctl.stop;
+      index++
+    ) {
+      st = await status(activity);
 
-  function feedbackCorrect(scope) {
-    if (scope.querySelector('[aria-label="Question completed"]')) return true;
-    if (all(scope, '.zb-explanation.correct, .message.correct')
-      .some(node => node.getClientRects().length > 0)) return true;
-    return all(scope, '.message').some(node =>
-      node.getClientRects().length > 0 && /^correct[!.]?$/i.test(clean(node.textContent))
-    );
-  }
-  function feedbackIncorrect(scope) {
-    if (scope.querySelector('.zb-explanation.incorrect, .message.incorrect')) return true;
-    return all(scope, '.message, .zb-explanation').some(node =>
-      /^(incorrect|try again|not quite|wrong)\b/i.test(clean(node.textContent))
-    );
-  }
-  function noteCorrectQuestion(question) {
-    if (!state.skippedQuestions.has(question)) {
-      state.skippedQuestions.add(question);
-      state.skippedQuestionCount++;
-    }
-  }
-  function noteCorrectTarget(target) {
-    if (!state.skippedTargets.has(target)) {
-      state.skippedTargets.add(target);
-      state.skippedTargetCount++;
-    }
-  }
-  function markReview(id, reason) {
-    state.manualNeeded.add(id);
-    console.debug('[zyPA]', id, reason);
-  }
+      if (st.complete) return;
 
-  function hash(str) {
-    // Stable compact fingerprint for question text and options.
-    let h = 2166136261;
-    for (let i = 0; i < str.length; i++) {
-      h ^= str.charCodeAt(i);
-      h = Math.imul(h, 16777619);
-    }
-    return (h >>> 0).toString(36);
-  }
+      const row = st.rows[index];
 
-  async function doMultipleChoice(activity, activityNo) {
-    const questions = all(activity, '.multiple-choice-question');
-    for (const [qi, question] of questions.entries()) {
-      if (!state.running || activityComplete(activity)) return;
-      if (feedbackCorrect(question)) {
-        noteCorrectQuestion(question);
-        continue; // Verified correct, no duplicate clicking.
-      }
-      const inputs = all(question, 'input[type="radio"]').filter(input => !input.disabled);
-      if (!inputs.length) continue;
+      // Never displace a verified correct match.
+      if (row.good) continue;
 
-      // Use only stable option/prompt text, excluding changing feedback.
-      const prompt = clean(question.querySelector(
-        '.question-text, .question-stem, .question-prompt'
-      )?.textContent);
-      const options = inputs.map(input => clean(
-        input.closest('label')?.textContent || input.parentElement?.textContent || input.value
-      ));
-      const signature = hash(JSON.stringify([prompt, options]));
-      const key = `${activityNo}:${qi}:${signature}`;
-      const selected = inputs.findIndex(input => input.checked);
-      // Capture existing wrong answers, including answers chosen in a prior run.
-      if (selected !== -1 && feedbackIncorrect(question)) {
-        rememberFailure('choices', key, selected);
-      } else if (selected !== -1 && !feedbackIncorrect(question)) {
-        // Selected but no success/failure feedback: don't blindly overwrite it.
-        markReview(activityNo, 'Selected answer has no recognizable feedback.');
+      if (row.occupied) {
+        if (
+          row.label === label &&
+          row.bad
+        ) {
+          saveWrong(historyKey, index);
+        }
+
         continue;
       }
-      const nextIndex = inputs.findIndex((_, index) =>
-        !failedBefore('choices', key, index)
+
+      if (wasWrong(historyKey, index)) {
+        continue;
+      }
+
+      const after = await place(
+        page,
+        activity,
+        label,
+        index
       );
-      if (nextIndex === -1) {
-        markReview(activityNo, 'All recognized answer choices were tried.');
+
+      if (after.good) {
+        solved.set(label, index);
+        matched = true;
+        break;
+      }
+
+      if (after.bad) {
+        saveWrong(historyKey, index);
         continue;
       }
-      const choice = inputs[nextIndex];
-      choice.click();
-      action();
-      await sleep(OPT.clickDelayMs);
 
-      if (feedbackCorrect(question)) {
-        noteCorrectQuestion(question);
-      } else if (feedbackIncorrect(question)) {
-        rememberFailure('choices', key, nextIndex);
-      } else {
-        markReview(activityNo, 'Answer feedback was not detected after click.');
-      }
+      // If feedback is not immediately available,
+      // don't assume that the match is wrong.
     }
-  }
 
-  function nativeSetValue(input, value) {
-    const proto = input instanceof HTMLTextAreaElement
-      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-    if (setter) setter.call(input, value);
-    else input.value = value;
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-  }
+    if (!matched) {
+      await checkMatching(activity);
 
-  async function doShortAnswer(activity, activityNo) {
-    const questions = all(activity, '.short-answer-question');
-    for (const question of questions) {
-      if (!state.running || activityComplete(activity)) return;
-      if (feedbackCorrect(question)) {
-        noteCorrectQuestion(question);
-        continue;
-      }
-      if (state.shortSubmitted.has(question)) continue;
-      const input = question.querySelector('textarea, input[type="text"]');
-      const check = question.querySelector('button.check-button');
-      const show = question.querySelector('button.show-answer-button');
-      if (!input || !check) continue;
+      st = await status(activity);
 
-      let revealed = question.querySelector('.forfeit-answer');
-      if (!revealed && show && !show.disabled) {
-        show.click(); action();
-        await sleep(250);
-        revealed = question.querySelector('.forfeit-answer');
-        if (!revealed && !show.disabled) {
-          show.click(); action();
-          await sleep(250);
-          revealed = question.querySelector('.forfeit-answer');
+      if (st.complete) return;
+
+      st.rows.forEach((r, idx) => {
+        if (r.good && r.label) {
+          solved.set(r.label, idx);
         }
-      }
-      if (!revealed) {
-        markReview(activityNo, 'No revealed short answer is available.');
-        continue;
-      }
-      const answer = clean(revealed.textContent);
-      if (!answer) continue;
-      // If this already has the correct text but is not marked correct,
-      // submit only once per run and wait for explicit feedback.
-      nativeSetValue(input, answer);
-      state.shortSubmitted.add(question);
-      await sleep(150);
-      if (!check.disabled) {
-        check.click(); action();
-        await sleep(OPT.clickDelayMs);
-      }
-      if (feedbackCorrect(question)) noteCorrectQuestion(question);
-      else markReview(activityNo, 'Short answer not verified correct yet.');
-    }
-  }
 
-  function isVisible(element) {
-    return Boolean(element?.isConnected && element.getClientRects().length);
-  }
-  function doAnimation(activity) {
-    if (activityComplete(activity)) return;
-    const controls = all(activity, '.animation-controls');
-    if (!controls.length) return;
-    for (const control of controls) {
-      if (control.querySelector('[aria-label="Play again"]')) continue;
-      for (const speed of all(control, '.speed-control input[type="checkbox"]')) {
-        if (isVisible(speed) && !speed.checked && !speed.disabled) {
-          speed.click(); action();
+        if (r.bad && r.label) {
+          saveWrong(
+            `${section}|a${activityNumber}|match|` +
+              keyHash(r.label),
+            idx
+          );
         }
-      }
-      const play = control.querySelector('button[aria-label="Play"]');
-      const pause = control.querySelector('button[aria-label="Pause"]');
-      if (pause && isVisible(pause)) continue; // Already running.
-      if (play && isVisible(play) && !play.disabled) {
-        play.click(); action();
-        continue;
-      }
-      const start = control.querySelector('button.start-button');
-      if (start && isVisible(start) && !start.disabled &&
-          !state.animationStarted.has(start)) {
-        state.animationStarted.add(start);
-        start.click(); action();
-      }
-    }
-  }
-
-  function rowOf(target) { return target.parentElement || target; }
-  function targetPopulated(target) {
-    return Boolean(target.querySelector('.term-bucket.populated, .draggable-object'));
-  }
-  function targetCorrect(target) {
-    if (!targetPopulated(target)) return false;
-    const row = rowOf(target);
-    return target.classList.contains('correct') ||
-      Boolean(target.querySelector('.correct')) ||
-      Boolean(row.querySelector('.correct, [aria-label="Question completed"]')) ||
-      all(row, '.message').some(node => /^correct[!.]?$/i.test(clean(node.textContent)));
-  }
-  function targetIncorrect(target) {
-    const row = rowOf(target);
-    return Boolean(row.querySelector('.incorrect')) ||
-      all(row, '.message').some(node => /^(incorrect|try again|wrong)\b/i.test(clean(node.textContent)));
-  }
-
-  function simulateDrag(source, target) {
-    if (!source?.isConnected || !target?.isConnected) return false;
-    const transfer = typeof DataTransfer === 'function'
-      ? new DataTransfer() : null;
-    const box = target.getBoundingClientRect();
-    const x = box.left + box.width / 2;
-    const y = box.top + box.height / 2;
-    function emit(element, name) {
-      let event;
-      try {
-        event = new DragEvent(name, {
-          bubbles: true, cancelable: true, dataTransfer: transfer,
-          clientX: x, clientY: y
-        });
-      } catch (_) {
-        event = new CustomEvent(name, { bubbles: true, cancelable: true });
-        Object.defineProperty(event, 'dataTransfer', { value: transfer });
-      }
-      element.dispatchEvent(event);
-    }
-    emit(source, 'dragstart');
-    emit(target, 'dragenter');
-    emit(target, 'dragover');
-    emit(target, 'drop');
-    emit(source, 'dragend');
-    return true;
-  }
-
-  async function doMatching(activity, activityNo) {
-    const targets = getTargets(activity);
-    if (!targets.length || activityComplete(activity)) return;
-    for (const target of targets) {
-      if (targetCorrect(target)) noteCorrectTarget(target);
-    }
-
-    // Include unresolved tiles left in *wrong* boxes from earlier runs.
-    // Only tiles in a verified-correct target are excluded.
-    const unresolvedTiles = getTiles(activity).filter(tile => {
-      const target = tile.closest('.draggable-object-target.definition-drag-container');
-      return !target || !targetCorrect(target);
-    }).sort((a, b) => {
-      const inWrongBox = tile => Number(Boolean(tile.closest(
-        '.draggable-object-target.definition-drag-container'
-      )));
-      return inWrongBox(b) - inWrongBox(a);
-    });
-    if (!unresolvedTiles.length) return;
-    const names = unresolvedTiles.map(tile => clean(tile.textContent)).filter(Boolean);
-    let dropsThisActivity = 0;
-
-    for (const tileName of names) {
-      if (!state.running || activityComplete(activity)) return;
-      const findSource = () => getTiles(activity).find(tile => {
-        const box = tile.closest('.draggable-object-target.definition-drag-container');
-        return clean(tile.textContent) === tileName && (!box || !targetCorrect(box));
       });
-      let foundCorrect = false;
-      for (let i = 0; i < targets.length; i++) {
-        if (!state.running || activityComplete(activity)) return;
-        if (dropsThisActivity >= OPT.maxDropsPerActivity) break;
-        const target = getTargets(activity)[i];
-        const source = findSource();
-        if (!source || !target) break;
-        if (targetCorrect(target)) { noteCorrectTarget(target); continue; }
-        if (targetPopulated(target)) continue; // Don't overwrite an occupied row.
-        const current = source.closest('.draggable-object-target.definition-drag-container');
-        if (current === target) continue;
-        const matchKey = `${activityNo}:${hash(tileName)}:${targets.length}`;
-        const attemptId = String(i);
-        const combo = `${matchKey}:${attemptId}`;
-        if (failedBefore('matching', matchKey, attemptId) ||
-            state.dragTriedThisRun.has(combo)) continue;
 
-        state.dragTriedThisRun.add(combo);
-        const previouslyLocated = source.isConnected;
-        if (!simulateDrag(source, target)) continue;
-        action();
-        state.drops++;
-        dropsThisActivity++;
-        await sleep(OPT.clickDelayMs);
-        const updated = getTargets(activity)[i] || target;
-        if (targetCorrect(updated)) {
-          noteCorrectTarget(updated);
-          foundCorrect = true;
-          break;
-        }
-        if (targetIncorrect(updated)) {
-          rememberFailure('matching', matchKey, attemptId);
-        }
-        const reacted = targetPopulated(updated) || !source.isConnected ||
-          (previouslyLocated && Boolean(updated.querySelector('.term-bucket.populated')));
-        if (!reacted) {
-          markReview(activityNo, 'The page did not respond to synthetic drag events.');
-          return;
-        }
-      }
-      if (!foundCorrect && findSource()) {
-        markReview(activityNo, 'A matching tile was not verified correct.');
-        // Do not keep moving other tiles when one remains unresolved.
+      if (!solved.has(label)) {
+        console.warn(
+          `Matching: no verified correct placement ` +
+          `for "${label}". Review.`
+        );
         return;
       }
     }
   }
 
-  try {
-    while (state.running && Date.now() - state.startedAt < OPT.maxRuntimeMs) {
-      if (location.pathname + location.search !== route) {
-        stop('Page changed. Rerun on the new section.');
-        break;
-      }
-      const activities = getActivities();
-      if (!activities.length) {
-        status('Waiting for participation activities to load…');
-        await sleep(OPT.loopDelayMs);
-        continue;
-      }
-
-      for (const [i, activity] of activities.entries()) {
-        if (!state.running) break;
-        const n = i + 1;
-        if (activityComplete(activity)) {
-          state.skippedActivities.add(n);
-          state.manualNeeded.delete(n);
-          continue;
-        }
-        await doMultipleChoice(activity, n);
-        await doShortAnswer(activity, n);
-        doAnimation(activity);
-        await doMatching(activity, n);
-        if (activityComplete(activity)) state.manualNeeded.delete(n);
-      }
-
-      const done = activities.filter(activityComplete).length;
-      const report =
-        `${done}/${activities.length} activities verified complete\n` +
-        `Skipped: ${state.skippedActivities.size} activities, ` +
-        `${state.skippedQuestionCount} questions, ` +
-        `${state.skippedTargetCount} matching rows\n` +
-        `${state.actions} actions (${state.drops} drags)\n` +
-        (state.manualNeeded.size
-          ? `Needs review: activity ${[...state.manualNeeded].join(', ')}`
-          : 'Scanning only unfinished activities…');
-      status(report);
-      if (done === activities.length) {
-        stop('All participation activities are verified complete.');
-        break;
-      }
-      const playing = activities.some(activity =>
-        all(activity, 'button[aria-label="Pause"]').some(isVisible)
-      );
-      if (!playing && Date.now() - state.lastActionAt > OPT.stalledMs) {
-        stop(report + '\nNo progress for 25 seconds; stopped safely.');
-        break;
-      }
-      await sleep(OPT.loopDelayMs);
-    }
-    if (state.running) stop('5-minute safety limit reached; rerun to resume.');
-  } catch (err) {
-    console.error('zyPA error:', err);
-    stop(`Stopped on error: ${err.message}. Check Console.`);
+  if (!(await status(activity)).complete) {
+    console.warn(
+      'Matching tiles handled; completion not confirmed.'
+    );
   }
-})();
+}
+
+// ---------- Process one section ----------
+
+async function runSection(
+  page,
+  entry,
+  sequence,
+  total
+) {
+  const url = entry.url;
+
+  console.log(
+    `\n[${sequence}/${total}] ${entry.label || url}`
+  );
+
+  await page.goto(url, {
+    waitUntil: 'domcontentloaded',
+    timeout: 30000
+  });
+
+  await wait(900);
+  await attachProgressPanel(page);
+
+  const activities = page.locator(ACTIVITY);
+
+  try {
+    await activities.first().waitFor({
+      timeout: 12000
+    });
+  } catch {
+    return {
+      url,
+      completed: 0,
+      total: 0,
+      note: 'No participation activities detected'
+    };
+  }
+
+  const count = await activities.count();
+
+  for (
+    let i = 0;
+    i < count && !ctl.stop;
+    i++
+  ) {
+    const activity = activities.nth(i);
+
+    // Live completion check before any interaction.
+    if ((await status(activity)).complete) {
+      ctl.skipped++;
+      continue;
+    }
+
+    try {
+      await tryChoices(activity, url, i);
+      await tryShortAnswers(activity);
+      await tryAnimations(activity);
+      await tryMatching(page, activity, url, i);
+    } catch (error) {
+      console.warn(
+        `Activity ${i + 1} needs review: ${error.message}`
+      );
+    }
+
+    const done = (await status(activity)).complete;
+
+    console.log(
+      `Activity ${i + 1}/${count}: ` +
+      (done ? 'complete' : 'not verified')
+    );
+
+    await updateProgressPanel(
+      page,
+      `${sequence}/${total} sections · ` +
+      `activity ${i + 1}/${count} · ` +
+      `${ctl.actions} actions`
+    );
+  }
+
+  let completed = 0;
+
+  for (let i = 0; i < count; i++) {
+    if ((await status(activities.nth(i))).complete) {
+      completed++;
+    }
+  }
+
+  return {
+    url,
+    completed,
+    total: count,
+    note: ctl.stop ? 'Stopped' : 'Checked'
+  };
+}
+
+// ---------- Progress overlay ----------
+
+async function attachProgressPanel(page) {
+  await page.evaluate(() => {
+    document.getElementById(
+      'zy-v5-progress'
+    )?.remove();
+
+    const box = document.createElement('aside');
+
+    box.id = 'zy-v5-progress';
+
+    box.style.cssText =
+      'position:fixed;right:16px;bottom:16px;' +
+      'z-index:2147483647;background:#192638;' +
+      'color:white;border-radius:10px;padding:14px;' +
+      'box-shadow:0 4px 20px #0005;' +
+      'font:13px system-ui;max-width:310px';
+
+    box.innerHTML =
+      '<b>zyBooks Section Runner</b>' +
+      '<div id="zy-v5-status" ' +
+      'style="margin:8px 0">Working…</div>';
+
+    const button = document.createElement('button');
+
+    button.textContent = 'Stop after current action';
+
+    button.onclick = () => window.zyStopRunner();
+
+    box.appendChild(button);
+    document.body.appendChild(box);
+  });
+}
+
+async function updateProgressPanel(page, text) {
+  try {
+    await page.evaluate(text => {
+      const el = document.getElementById(
+        'zy-v5-status'
+      );
+
+      if (el) el.textContent = text;
+    }, text);
+  } catch {}
+}
+
+// ---------- Chapter/section picker ----------
+
+async function showPicker(page) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      await page.exposeFunction(
+        'zyStartRunner',
+        selection => resolve(selection)
+      );
+
+      await page.evaluate(({ course, root }) => {
+        document.getElementById(
+          'zy-v5-picker'
+        )?.remove();
+
+        const panel = document.createElement('aside');
+
+        panel.id = 'zy-v5-picker';
+
+        panel.style.cssText =
+          'position:fixed;right:15px;top:65px;' +
+          'z-index:2147483647;width:360px;' +
+          'max-width:calc(100vw - 30px);' +
+          'max-height:80vh;overflow:auto;' +
+          'background:#15253a;color:white;' +
+          'border:1px solid #49617b;padding:16px;' +
+          'border-radius:12px;' +
+          'box-shadow:0 6px 30px #0008;' +
+          'font:13px system-ui';
+
+        const heading = document.createElement('h3');
+
+        heading.textContent =
+          'zyBooks Section Runner v5';
+
+        heading.style.margin = '0 0 8px';
+        panel.appendChild(heading);
+
+        const help = document.createElement('p');
+
+        help.textContent =
+          'Choose chapters or sections, then Start. ' +
+          'Only participation activities will be processed.';
+
+        panel.appendChild(help);
+
+        const controls = document.createElement('div');
+        const list = document.createElement('div');
+
+        list.style.cssText =
+          'max-height:38vh;overflow:auto;' +
+          'border:1px solid #42566c;padding:8px';
+
+        const input = document.createElement('input');
+
+        input.placeholder =
+          'Optional: 6.1, 6.3, 7.1-7.4';
+
+        input.style.cssText =
+          'width:100%;margin:10px 0;' +
+          'padding:7px;box-sizing:border-box';
+
+        const info = document.createElement('div');
+
+        info.style.cssText =
+          'margin:6px 0;color:#c9d4e6';
+
+        const mkButton = (caption, fn) => {
+          const b = document.createElement('button');
+
+          b.textContent = caption;
+
+          b.style.cssText =
+            'margin:3px;padding:6px;cursor:pointer';
+
+          b.addEventListener('click', fn);
+          controls.appendChild(b);
+        };
+
+        let entries = [];
+
+        function scan() {
+          const found = new Map();
+
+          for (
+            const anchor of document.querySelectorAll(
+              'a[href]'
+            )
+          ) {
+            let url;
+
+            try {
+              url = new URL(anchor.href);
+            } catch {
+              continue;
+            }
+
+            const m = url.pathname.match(
+              /\/chapter\/(\d+)\/section\/(\d+)\/?$/
+            );
+
+            if (
+              !m ||
+              url.origin !== 'https://learn.zybooks.com' ||
+              !url.pathname.startsWith(
+                `/zybook/${course}/`
+              )
+            ) {
+              continue;
+            }
+
+            const ch = Number(m[1]);
+            const sec = Number(m[2]);
+
+            found.set(`${ch}.${sec}`, {
+              ch,
+              sec,
+              url: `${root}/chapter/${ch}/section/${sec}`,
+              label:
+                `${ch}.${sec} — ` +
+                (anchor.textContent.trim() || 'Section')
+            });
+          }
+
+          entries = [...found.values()].sort(
+            (a, b) =>
+              a.ch - b.ch ||
+              a.sec - b.sec
+          );
+
+          list.replaceChildren();
+
+          const groups = new Map();
+
+          for (const entry of entries) {
+            if (!groups.has(entry.ch)) {
+              groups.set(entry.ch, []);
+            }
+
+            groups.get(entry.ch).push(entry);
+          }
+
+          for (const [chapter, members] of groups) {
+            const section = document.createElement('div');
+
+            section.style.cssText =
+              'margin:6px 0;' +
+              'border-bottom:1px solid #40516a';
+
+            const chLabel = document.createElement('label');
+            const chBox = document.createElement('input');
+
+            chBox.type = 'checkbox';
+
+            chLabel.append(
+              chBox,
+              ` Chapter ${chapter} (${members.length} sections)`
+            );
+
+            chLabel.style.fontWeight = 'bold';
+            section.appendChild(chLabel);
+
+            const checks = [];
+
+            for (const entry of members) {
+              const label = document.createElement('label');
+
+              label.style.cssText =
+                'display:block;margin:4px 0 4px 14px';
+
+              const checkbox = document.createElement('input');
+
+              checkbox.type = 'checkbox';
+              checkbox.className = 'zy-v5-choice';
+              checkbox.dataset.url = entry.url;
+              checkbox.dataset.label = entry.label;
+
+              label.append(
+                checkbox,
+                ` ${entry.label}`
+              );
+
+              section.appendChild(label);
+              checks.push(checkbox);
+            }
+
+            chBox.addEventListener(
+              'change',
+              () => checks.forEach(
+                c => c.checked = chBox.checked
+              )
+            );
+
+            list.appendChild(section);
+          }
+
+          info.textContent =
+            `Detected ${entries.length} linked sections. ` +
+            'Expand TOC chapters and press Rescan ' +
+            'if some are missing.';
+        }
+
+        mkButton('Select all', () =>
+          panel.querySelectorAll(
+            '.zy-v5-choice'
+          ).forEach(x => x.checked = true)
+        );
+
+        mkButton('Clear', () =>
+          panel.querySelectorAll(
+            '.zy-v5-choice'
+          ).forEach(x => x.checked = false)
+        );
+
+        mkButton('Rescan TOC', scan);
+
+        const start = document.createElement('button');
+
+        start.textContent = 'Start selected sections';
+
+        start.style.cssText =
+          'background:#69d7a8;color:#10251e;' +
+          'font-weight:bold;padding:9px 12px;' +
+          'cursor:pointer;border:0;border-radius:6px';
+
+        start.addEventListener('click', async () => {
+          const out = new Map();
+
+          for (
+            const box of panel.querySelectorAll(
+              '.zy-v5-choice:checked'
+            )
+          ) {
+            out.set(box.dataset.url, {
+              url: box.dataset.url,
+              label: box.dataset.label
+            });
+          }
+
+          const manual = input.value
+            .split(/[,;\n]+/)
+            .map(s => s.trim())
+            .filter(Boolean);
+
+          for (const term of manual) {
+            const m = term.match(
+              /^(\d+)\.(\d+)(?:\s*-\s*(\d+))?$/
+            );
+
+            if (!m) {
+              info.textContent =
+                `Invalid manual section: ${term}`;
+              return;
+            }
+
+            const ch = +m[1];
+            const from = +m[2];
+            const to = +(m[3] || m[2]);
+
+            if (
+              ch < 1 ||
+              from < 1 ||
+              to < from ||
+              to - from > 30
+            ) {
+              info.textContent =
+                `Invalid section range: ${term}`;
+              return;
+            }
+
+            for (let s = from; s <= to; s++) {
+              const url =
+                `${root}/chapter/${ch}/section/${s}`;
+
+              out.set(url, {
+                url,
+                label: `${ch}.${s} (manual)`
+              });
+            }
+          }
+
+          if (!out.size || out.size > 80) {
+            info.textContent =
+              'Choose 1–80 sections.';
+            return;
+          }
+
+          start.disabled = true;
+          info.textContent = 'Starting...';
+
+          try {
+            await window.zyStartRunner(
+              [...out.values()]
+            );
+          } catch (error) {
+            info.textContent = error.message;
+            start.disabled = false;
+          }
+        });
+
+        panel.append(
+          controls,
+          list,
+          input,
+          info,
+          start
+        );
+
+        document.body.appendChild(panel);
+        scan();
+      }, {
+        course: COURSE,
+        root: ROOT
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+// ---------- Main ----------
+
+async function main() {
+  const browser = await chromium.launchPersistentContext(
+    PROFILE,
+    {
+      headless: false,
+      viewport: {
+        width: 1400,
+        height: 960
+      }
+    }
+  );
+
+  const page =
+    browser.pages()[0] ||
+    await browser.newPage();
+
+  const rl = readline.createInterface({
+    input: stdin,
+    output: stdout
+  });
+
+  await page.exposeFunction(
+    'zyStopRunner',
+    () => {
+      ctl.stop = true;
+    }
+  );
+
+  try {
+    await page.goto(ROOT, {
+      waitUntil: 'domcontentloaded'
+    });
+
+    console.log(
+      'Sign in to zyBooks if prompted. ' +
+      'Navigate to the course TOC.'
+    );
+
+    await rl.question(
+      'When the table of contents is visible, ' +
+      'press ENTER here...'
+    );
+
+    const selected = await showPicker(page);
+
+    const unique = [...new Map(
+      selected
+        .filter(x => validSection(x.url))
+        .map(x => [x.url, x])
+    ).values()];
+
+    if (!unique.length) {
+      throw Error('No valid sections selected.');
+    }
+
+    console.log(
+      `Selected ${unique.length} sections.`
+    );
+
+    for (
+      let i = 0;
+      i < unique.length && !ctl.stop;
+      i++
+    ) {
+      try {
+        ctl.results.push(
+          await runSection(
+            page,
+            unique[i],
+            i + 1,
+            unique.length
+          )
+        );
+      } catch (error) {
+        ctl.results.push({
+          url: unique[i].url,
+          note: error.message
+        });
+
+        console.warn(
+          `Section failed: ${error.message}`
+        );
+      }
+    }
+
+    console.table(ctl.results);
+
+    console.log(
+      `Actions: ${ctl.actions}, ` +
+      `verified activity skips: ${ctl.skipped}`
+    );
+
+    console.log(
+      `Saved feedback-confirmed wrong answers in ${HISTORY}`
+    );
+
+    await updateProgressPanel(
+      page,
+      'Finished. See Terminal summary.'
+    );
+
+    await rl.question(
+      'Press ENTER to close the browser...'
+    );
+  } finally {
+    rl.close();
+    await browser.close();
+  }
+}
+
+main().catch(e => {
+  console.error(e);
+  process.exitCode = 1;
+});
